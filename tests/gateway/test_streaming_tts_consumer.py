@@ -690,3 +690,84 @@ class TestEndpointReportedRate:
             assert len(adapter.written_chunks) == 2
 
         _run_test(run)
+
+
+# ---------------------------------------------------------------------------
+# Finalisation waits on an idle stream, not a total budget
+# ---------------------------------------------------------------------------
+
+
+class PacedStreamer(FakeStreamer):
+    """Synthesises slower than real time but never stalls: one chunk every ``gap`` seconds."""
+
+    def __init__(self, chunks_per_clause, gap):
+        super().__init__(chunks_per_clause=chunks_per_clause)
+        self.gap = gap
+
+    def stream(self, text: str):
+        for chunk in super().stream(text):
+            time.sleep(self.gap)  # health: allow HX013 -- the contract is a drain outlasting the idle window
+            yield chunk
+
+
+class TurnMarkingAdapter(FakeVoiceAdapter):
+    def __init__(self):
+        super().__init__()
+        self.completed_turns = []
+
+    def _mark_streaming_tts_completed_turn(self, session_key, turn_marker=None):
+        self.completed_turns.append((session_key, turn_marker))
+
+
+def _finalize(adapter, consumer):
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+
+    turn_ctx = TurnContext(streaming_tts_consumer_holder=[consumer], session_key="voice-session", run_generation=1)
+    return GatewayTurnMixin()._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+
+
+class TestFinalizeIdleTimeout:
+    """The reply text is complete long before slow synthesis catches up; only a stall may cut it off."""
+
+    def test_progressing_stream_outlasting_idle_timeout_is_spoken_whole(self, monkeypatch):
+        idle_timeout, gap, chunks = 2.0, 0.2, 15
+        monkeypatch.setattr("gateway.streaming_tts_consumer.DRAIN_IDLE_TIMEOUT_S", idle_timeout)
+
+        async def run(loop):
+            adapter = TurnMarkingAdapter()
+            consumer = _make_consumer(adapter, "chat1", loop, PacedStreamer(chunks, gap))
+            consumer.start()
+            consumer.on_delta("A long reply that takes longer to speak than the idle window. ")
+
+            started = time.monotonic()
+            await _finalize(adapter, consumer)
+
+            assert time.monotonic() - started > idle_timeout
+            assert consumer.completed is True
+            assert len(adapter.written_chunks) == chunks
+            assert (adapter.finish_count, adapter.abort_count) == (1, 0)
+            assert adapter.completed_turns == [("voice-session", 1)]
+
+        _run_test(run, timeout=30.0)
+
+    def test_stalled_stream_is_aborted_after_idle_timeout_and_keeps_suppression(self, monkeypatch):
+        monkeypatch.setattr("gateway.streaming_tts_consumer.DRAIN_IDLE_TIMEOUT_S", 0.2)
+
+        async def run(loop):
+            adapter = TurnMarkingAdapter()
+            streamer = BlockingSecondChunkStreamer()
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+            consumer.start()
+            consumer.on_delta("This sentence stalls after its first chunk. ")
+            try:
+                await _finalize(adapter, consumer)
+            finally:
+                streamer.allow_remaining_chunks.set()
+
+            assert consumer.completed is False
+            assert adapter.abort_count == 1 and adapter.finish_count == 0
+            assert adapter.written_chunks == [b"chunk-1-0"]
+            assert adapter.completed_turns == [("voice-session", 1)]
+
+        _run_test(run)

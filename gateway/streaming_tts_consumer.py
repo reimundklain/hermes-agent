@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -22,6 +23,9 @@ logger = logging.getLogger("gateway.streaming_tts_consumer")
 
 _ABORT = object()
 _DONE = object()
+
+# Synthesis may lag the finished reply text by minutes; only this long without new PCM is a stall.
+DRAIN_IDLE_TIMEOUT_S = 10.0
 
 
 class _HandleDeclined(Exception):
@@ -46,6 +50,7 @@ class StreamingTTSConsumer:
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=256)
         self._handle: Optional[StreamingTTSHandle] = None
         self._task: Optional[asyncio.Task] = None  # drain task, created once by start()
+        self._last_progress = 0.0  # monotonic time of the last PCM write, read by wait_drained()
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
@@ -204,6 +209,7 @@ class StreamingTTSConsumer:
                 raise _HandleDeclined()
             was_audible = self._handle.audible
             await self._adapter.write_streaming_tts(self._handle, chunk)
+            self._last_progress = time.monotonic()
             if not was_audible:
                 self._handle.audible = self._suppress_whole_file = True
 
@@ -230,6 +236,18 @@ class StreamingTTSConsumer:
         if self._handle is not None and not self._handle.aborted:
             with contextlib.suppress(Exception):
                 self._loop.call_soon_threadsafe(asyncio.create_task, self._safe_abort(reason))
+
+    async def wait_drained(self) -> None:
+        """Wait for the drain task while it keeps writing PCM: return once it ends, or once no chunk
+        was written for ``DRAIN_IDLE_TIMEOUT_S`` seconds (the caller decides whether to abort)."""
+        if self._task is None:
+            return
+        self._last_progress = time.monotonic()
+        while not self._task.done():
+            idle_left = self._last_progress + DRAIN_IDLE_TIMEOUT_S - time.monotonic()
+            if idle_left <= 0:
+                return
+            await asyncio.wait({self._task}, timeout=idle_left)
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
