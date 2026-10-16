@@ -22,6 +22,7 @@ from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config
 from tools.tts_tool_plugins import _plugin_pcm_streaming_provider, _plugin_voice_kwargs
 from tools.tts_tool_providers import DEFAULT_XAI_SAMPLE_RATE
+from tools.tts_text_normalize_de import is_german_speech
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ def take_speech_interrupted() -> bool:
 
 # Sentence boundary: after .!? followed by whitespace, or a blank line.
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
+# German: a dot after a digit closes a date or ordinal ("der 17. Oktober"), which must reach the
+# per-sentence cleanup whole; a sentence ending in a number merges with the next one instead.
+_GERMAN_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?<!\d\.)(?:\s|\n)|(?:\n\n)")
 # Reasoning tags come from the one canonical list (agent.think_scrubber), matched case-insensitively,
 # so feed() and flush() strip/cut exactly the tags every other reasoning-hiding surface does.
 _THINK_NAMES = "|".join(re.escape(name) for name in THINK_TAG_NAMES)
@@ -77,19 +81,24 @@ class SentenceChunker:
     speak-stream WebSocket so every surface cuts speech identically. Strips ``<think>`` blocks (even
     split across deltas) and merges fragments shorter than *min_len* into the following sentence."""
 
-    def __init__(self, min_len: int = 20):
+    def __init__(self, min_len: int = 20, boundary: re.Pattern[str] = SENTENCE_BOUNDARY_RE):
         self.min_len = min_len
+        self.boundary = boundary
         self.buf = ""
 
     @classmethod
     def from_config(cls, tts_config: dict) -> SentenceChunker:
-        """Chunker honouring ``tts.streaming.min_len``. 20 suits English; a CJK opener of 5–7
-        characters is a whole clause, so voice setups lower it to speak the first sentence
-        alone instead of buffering it behind the second. Floor 1: 0 would emit every boundary."""
-        try:
-            return cls(min_len=max(1, int((tts_config.get("streaming") or {}).get("min_len", 20))))
-        except (AttributeError, TypeError, ValueError):  # non-mapping / non-numeric → default
+        """Chunker honouring ``tts.streaming.min_len`` and ``tts.language``. 20 suits English; a CJK
+        opener of 5–7 characters is a whole clause, so voice setups lower it to speak the first
+        sentence alone instead of buffering it behind the second. Floor 1: 0 would emit every boundary."""
+        if not isinstance(tts_config, dict):
             return cls()
+        german = is_german_speech(str(tts_config.get("language") or ""))
+        boundary = _GERMAN_SENTENCE_BOUNDARY_RE if german else SENTENCE_BOUNDARY_RE
+        try:
+            return cls(min_len=max(1, int((tts_config.get("streaming") or {}).get("min_len", 20))), boundary=boundary)
+        except (AttributeError, TypeError, ValueError):  # non-mapping section / non-numeric → default
+            return cls(boundary=boundary)
 
     def feed(self, delta: str) -> list[str]:
         """Absorb *delta*; return every complete sentence now ready to speak."""
@@ -98,7 +107,7 @@ class SentenceChunker:
             return []  # open think tag — the closing tag may arrive next delta
         out: list[str] = []
         start = 0  # skip boundaries that would leave the head too short
-        while m := SENTENCE_BOUNDARY_RE.search(self.buf, start):
+        while m := self.boundary.search(self.buf, start):
             head = self.buf[: m.end()]
             if len(head.strip()) < self.min_len:
                 start = m.end()

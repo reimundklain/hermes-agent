@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import html
 import re
+from functools import partial
+
+from tools.tts_text_normalize_de import expand_german_numbers, expand_german_symbols, is_german_speech
 
 # Sentinel appended to former heading lines so smooth_whitespace_for_tts folds the
 # heading into the sentence after it ("Weather, it will be sunny") instead of a bare
@@ -94,12 +97,16 @@ def _normalize_temperature_ranges(text: str) -> str:
     return text
 
 
-def normalize_symbols_for_tts(text: str) -> str:
-    """Expand common symbols/shorthand into words a TTS engine reads well."""
+def normalize_symbols_for_tts(text: str, language: str = "") -> str:
+    """Expand common symbols/shorthand into words a TTS engine reads well: English words unless
+    ``language`` is German."""
     if not text:
         return ""
     text = re.sub("[   ]", " ", str(text))  # non-breaking / thin spaces
     text = text.replace("\u2212", "-").replace("…", "...")  # minus sign, ellipsis
+    if is_german_speech(language):
+        text = expand_german_symbols(text)
+        return _EMOJI_RE.sub("", _VARIATION_SELECTOR_RE.sub("", text))
     text = _normalize_temperature_ranges(text)
     # Temperatures with a number first, then bare units ("measured in degrees C"),
     # then any remaining degree symbol (angles, stray cases).
@@ -280,14 +287,27 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+def expand_numbers_for_tts(text: str, language: str = "") -> str:
+    """Spell numbers, clock times and dates out for German scripts; English voices read digits well."""
+    return expand_german_numbers(text) if is_german_speech(language) else text
+
+
+def _configured_tts_language() -> str:
+    from tools.tts_tool import _load_tts_config  # late: text cleanup must not load the TTS tool on import
+
+    return str(_load_tts_config().get("language") or "")
+
+
+def prepare_spoken_text(text: str, max_chars: int | None = 4000, language: str | None = None) -> str:
     """Return a TTS-friendly script from assistant text (deterministic cleanup, not a rewrite).
     Pipeline: non-spoken blocks > Markdown > symbols/units > identifier-dense tokens >
-    line formatting into sentence pauses > single line (for newline-sensitive providers),
-    then ``max_chars``."""
+    numbers > line formatting into sentence pauses > single line (for newline-sensitive
+    providers), then ``max_chars``. ``language`` defaults to the configured ``tts.language``."""
+    if language is None:
+        language = _configured_tts_language()
     spoken = text
-    for step in (strip_nonspoken_blocks, strip_markdown_for_tts, normalize_symbols_for_tts,
-                 prune_identifier_tokens_for_tts,
+    for step in (strip_nonspoken_blocks, strip_markdown_for_tts, partial(normalize_symbols_for_tts, language=language),
+                 prune_identifier_tokens_for_tts, partial(expand_numbers_for_tts, language=language),
                  smooth_whitespace_for_tts, flatten_newlines_for_payload):
         spoken = step(spoken)
     if max_chars is not None and max_chars > 0 and len(spoken) > max_chars:

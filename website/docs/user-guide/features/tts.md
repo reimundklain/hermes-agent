@@ -50,6 +50,7 @@ Convert text to speech with eleven providers:
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper" — or "nous" for the managed Tool Gateway (written when you pick Nous Subscription in `hermes tools`)
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
+  language: ""                  # "de": numbers, clock times, dates, money and units spoken as German words
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
     speed: 1.0                  # Converted to rate percentage (+/-%)
@@ -159,6 +160,8 @@ The rewrite uses `auxiliary.tts_audio_tags` and defaults to your main chat model
 **Language (OpenAI-compatible endpoints)**: `tts.openai.language` is forwarded to the endpoint as a `lang_code` request parameter. It is intended for OpenAI-compatible TTS servers that support `lang_code` — for example [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI), where `language: "es"` selects the Spanish phonemizer instead of the English default. Leave it unset when using the official OpenAI API, which does not accept this parameter. When unset, nothing extra is sent.
 
 **Cloned-voice consent (OpenAI-compatible endpoints)**: some self-hosted OpenAI-compatible TTS servers reject a cloned voice with `400 consent_required` unless the request carries a `consent_attestation` field. Set `tts.openai.consent_attestation` to the attestation text your server expects; Hermes forwards it verbatim in the request body on every OpenAI-compatible path (whole-file synthesis, streaming, and the desktop's client-direct voice). Leave it unset for the official OpenAI API — when unset, the field is not sent.
+
+**Spoken-script language (all providers)**: before synthesis Hermes turns each reply into a spoken script, writing symbols such as `°C`, `%` and `€` out as English words. For German replies set `tts.language: "de"`: clock times, dates, money, units and numbers are then spelled out as German words (`um 18:12 Uhr` → "um achtzehn Uhr zwölf", `0,32 €/kWh` → "zweiunddreißig Cent pro Kilowattstunde"), so voices no longer read digits and unit words with English pronunciation. Unlike `tts.openai.language`, nothing is sent to the provider.
 
 
 ### Input length limits
